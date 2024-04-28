@@ -1,4 +1,7 @@
 #include <cstdlib>
+#include <cmath>
+
+#include <iostream>
 
 #include <QApplication>
 #include <QPushButton>
@@ -16,20 +19,84 @@
 
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/vtk_lib_io.h>
+#include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/filters/extract_indices.h>
 
-void createVTKObject(QString &fileName, vtkRenderer* renderer, vtkGenericOpenGLRenderWindow* renderWindow) {
+#include <pcl/ModelCoefficients.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/sac_model_cylinder.h>
 
-  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+static pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+static bool isLoaded = false;
+
+void calculateRadius(void) {
+  extern pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
+
+  std::cout << "Calculating...\n";
+
+  // Estimate surface normals
+  pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+  ne.setInputCloud (cloud);
+  pcl::search::KdTree<pcl::PointXYZ>::Ptr tree (new pcl::search::KdTree<pcl::PointXYZ> ());
+  ne.setSearchMethod (tree);
+  pcl::PointCloud<pcl::Normal>::Ptr normals (new pcl::PointCloud<pcl::Normal>);
+  ne.setRadiusSearch (0.03); // adjust this parameter as needed
+  ne.compute (*normals);
+
+  // Concatenate the XYZ and normal fields
+  pcl::PointCloud<pcl::PointNormal>::Ptr cloud_with_normals (new pcl::PointCloud<pcl::PointNormal>);
+  pcl::concatenateFields (*cloud, *normals, *cloud_with_normals);
+
+  // Create the segmentation object for cylinder segmentation and set parameters
+  pcl::SACSegmentationFromNormals<pcl::PointNormal, pcl::Normal> seg;
+  pcl::PointIndices::Ptr inliers (new pcl::PointIndices ());
+  pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients ());
+  seg.setOptimizeCoefficients (true);
+  seg.setModelType (pcl::SACMODEL_CYLINDER);
+  seg.setMethodType (pcl::SAC_RANSAC);
+  seg.setNormalDistanceWeight (0.1);
+  seg.setMaxIterations (10000);
+  seg.setDistanceThreshold (0.05);
+  seg.setRadiusLimits (0, 0.1); // set acceptable range for cylinder radius
+  seg.setInputCloud (cloud_with_normals);
+  seg.setInputNormals (normals);
+
+  // Obtain cylinder inliers and coefficients
+  seg.segment (*inliers, *coefficients);
+
+  // Fit cylinder using inliers
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cylinder_points (new pcl::PointCloud<pcl::PointXYZ>);
+  pcl::ExtractIndices<pcl::PointXYZ> extract;
+  extract.setInputCloud (cloud);
+  extract.setIndices (inliers);
+  extract.setNegative (false);
+  extract.filter (*cylinder_points);
+
+  // Estimate radius of curvature
+  double radius = std::abs(coefficients->values[6]);
+
+  std::cout << "Radius of the cylinder: " << radius << '\n';
+
+  std::cout << "Done\n";
+}
+
+void loadObject(QString &fileName, vtkRenderer* renderer, vtkGenericOpenGLRenderWindow* renderWindow) {
 
   vtkSmartPointer<vtkPolyData> polydata = vtkSmartPointer<vtkPolyData>::New();
   vtkSmartPointer<vtkPolyDataMapper> mapper = vtkSmartPointer<vtkPolyDataMapper>::New();
   vtkSmartPointer<vtkActor> actor = vtkSmartPointer<vtkActor>::New();
 
-  if (pcl::io::loadPCDFile(fileName.toStdString(), *cloud) == -1) {
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(fileName.toStdString(), *cloud) == -1) {
     // PCL_ERROR("Couldn't read PCD file!\n");
     std::exit(EXIT_FAILURE);
   }
+
+  isLoaded = true;
+
   pcl::io::pointCloudTovtkPolyData(*cloud, polydata.Get());
 
   mapper->SetInputData(polydata);
@@ -64,24 +131,26 @@ int main(int argc, char* argv[]) {
 
     // Create buttons
     QPushButton* loadFigureButton = new QPushButton("Load Figure", &mainWindow);
-    loadFigureButton->setFixedSize(100, 30);  // Set the desired width and height
+    loadFigureButton->setFixedSize(150, 40);
+
     QPushButton* QuitButton = new QPushButton("Quit", &mainWindow);
-    QuitButton->setFixedSize(100, 30);
+    QuitButton->setFixedSize(150, 40);
+
     QPushButton* selectFileButton = new QPushButton("Select File", &mainWindow);
-    selectFileButton->setFixedSize(100, 30);
-    // QPushButton* QuitButton = new QPushButton("Quit", &mainWindow);
-    // QuitButton->setFixedSize(100, 30);
+    selectFileButton->setFixedSize(150, 40);
+
+    QPushButton* RadiusEstimButton = new QPushButton("Estimate Radius", &mainWindow);
+    RadiusEstimButton->setFixedSize(150, 40);
 
     // Create a main layout
     QVBoxLayout* mainLayout = new QVBoxLayout(&mainWindow);
 
     // Create a vertical layout for the buttons
     QVBoxLayout* buttonLayout = new QVBoxLayout();
-    buttonLayout->addWidget(loadFigureButton);
     buttonLayout->addWidget(selectFileButton);
+    buttonLayout->addWidget(loadFigureButton);
+    buttonLayout->addWidget(RadiusEstimButton);
     buttonLayout->addWidget(QuitButton);
-
-
 
     buttonLayout->addStretch();
 
@@ -109,16 +178,25 @@ int main(int argc, char* argv[]) {
 
     QObject::connect(loadFigureButton, &QPushButton::clicked, [&]() {
       if (!fileName.isEmpty()) {
-        createVTKObject(fileName, renderer.Get(), renderWindow.Get());
+        loadObject(fileName, renderer.Get(), renderWindow.Get());
       }
       else {
         std::cerr << "Invalid file argument\n";
       }
 
     });
-     QObject::connect(QuitButton, &QPushButton::clicked, [&]() {
+
+    QObject::connect(QuitButton, &QPushButton::clicked, [&]() {
       mainWindow.close();
     });
+
+    QObject::connect(RadiusEstimButton, &QPushButton::clicked, [&]() {
+      if (isLoaded)
+        calculateRadius();
+      else
+        std::cerr << "PCD file initialization error...\n";
+    });
+
     QObject::connect(selectFileButton, &QPushButton::clicked, [&]() {
       // Open the file selection dialog
       if (fileName.isEmpty())
